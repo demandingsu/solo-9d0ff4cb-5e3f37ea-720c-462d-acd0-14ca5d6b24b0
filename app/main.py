@@ -5,9 +5,9 @@ import contextlib
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
-from . import db, services
+from . import alerts, db, services
 from .config import settings
 from .errors import StorageError
 from .storage import file_manager
@@ -70,6 +70,72 @@ class ListBatchesResponse(BaseModel):
     station_id: str
     day: str
     batches: List[BatchInfo]
+
+
+# ------------------------------------------------------------- alert schemas
+class RegionalAlertRequest(BaseModel):
+    day: str = Field(..., description="UTC day, YYYY-MM-DD")
+    station_ids: List[str] = Field(
+        ...,
+        min_length=alerts.MIN_REQUEST_STATIONS,
+        max_length=alerts.MAX_REQUEST_STATIONS,
+        description="2-5 station ids; all data must belong to the same UTC day",
+    )
+    period_start: str = Field(
+        ..., description="UTC ISO-8601 minute-aligned start, e.g. 2026-11-12T08:00Z"
+    )
+    period_end: str = Field(
+        ...,
+        description=(
+            "UTC ISO-8601 minute-aligned exclusive end; the period may span at "
+            "most 120 minutes"
+        ),
+    )
+    threshold_mm: float = Field(
+        ..., ge=0, description="30-minute accumulated rainfall threshold in mm"
+    )
+
+    @field_validator("station_ids")
+    @classmethod
+    def _no_duplicate_stations(cls, value: List[str]) -> List[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("station_ids must not contain duplicates")
+        return value
+
+
+class AlertMinute(BaseModel):
+    obs_time: str
+    rain_mm: float
+
+
+class AlertParticipant(BaseModel):
+    station_id: str
+    rain_total_mm: float
+    minutes: List[AlertMinute]
+
+
+class AlertWindow(BaseModel):
+    window_start: str
+    window_end: str
+    participating_station_count: int
+    participating_stations: List[AlertParticipant]
+
+
+class RegionalAlertResponse(BaseModel):
+    triggered: bool
+    alert: Optional[AlertWindow]
+    reason: Optional[str] = None
+    day: str
+    station_ids: List[str]
+    window_minutes: int
+    threshold_mm: float
+    period_start: str
+    period_end: str
+    period_minutes: int
+    windows_evaluated: int
+    snapshot_token: str
+    batch_ids_by_station: dict
+    station_statuses: Optional[List[dict]] = None
 
 
 # ---------------------------------------------------------------- app setup
@@ -185,3 +251,25 @@ def get_batches(
 @app.post("/admin/reap", tags=["ops"], summary="Force reaping of unreferenced superseded files")
 def force_reap() -> dict:
     return services.force_reap()
+
+
+@app.post(
+    "/alerts/regional-rainfall",
+    response_model=RegionalAlertResponse,
+    tags=["alert"],
+    summary=(
+        "Find the earliest 30-minute window where at least two stations each "
+        "have complete observations reaching the accumulated-rain threshold"
+    ),
+)
+def regional_rainfall_alert(payload: RegionalAlertRequest) -> RegionalAlertResponse:
+    # Semantic validation (day-relative times, <=120 min span, station format)
+    # lives in the service layer; AlertValidationError maps to HTTP 422.
+    result = alerts.determine_regional_alert(
+        day=payload.day,
+        station_ids=payload.station_ids,
+        period_start=payload.period_start,
+        period_end=payload.period_end,
+        threshold_mm=payload.threshold_mm,
+    )
+    return RegionalAlertResponse(**result)

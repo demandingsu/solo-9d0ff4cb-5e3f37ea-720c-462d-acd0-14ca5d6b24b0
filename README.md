@@ -1,12 +1,12 @@
-# 雨量站批次存储 API（FastAPI + PyArrow + SQLite）
+# 雨量站批次存储 + 区域强降雨判定 API（FastAPI + PyArrow + SQLite）
 
 把雨量站频繁上传的小批 CSV 观测持久化为独立 Parquet 批次，按站日合并成
-单个日文件，供暴雨复盘脚本以**快照一致**的方式读取。
+单个日文件，并对**同一已发布快照**内的多站分钟雨量做区域强降雨滑动窗口判定。
 
 - **Web 框架**：FastAPI（同步端点，跑在 threadpool 上，避免阻塞事件循环）
 - **列存文件**：PyArrow / Parquet（zstd 压缩，UTC 毫秒时间戳）
 - **元数据**：SQLite（WAL 模式，`BEGIN IMMEDIATE` 事务 + 进程内写锁）
-- **交付**：可直接启动的 Docker Compose、本地样例 CSV、一键演示脚本、13 个测试
+- **交付**：可直接启动的 Docker Compose、本地样例 CSV、一键演示脚本、34 个测试
 
 ## 目录结构
 
@@ -16,12 +16,13 @@ app/
   db.py          SQLite 连接、WAL/忙等待、串行化写事务、表结构
   errors.py      领域异常 -> HTTP 状态码映射
   ingestion.py   CSV 解析/校验、规范 Parquet schema、记录去留（不去重、不排序）
-  storage.py     Parquet 原子写、查询快照与引用计数、后台清理、崩溃恢复扫描
+  storage.py     Parquet 原子写、单站/多站查询快照与引用计数、后台清理、崩溃恢复
+  alerts.py      区域强降雨判定：参数校验、分钟序列归并、30 分钟逐分钟滑动窗口
   services.py    上传 / 查询 / 合并 / 列表 的事务编排
   main.py        FastAPI 路由与生命周期
-samples/         本地雨量 CSV 样例（含中文表头样例与故意保留的重复行）
+samples/         本地雨量 CSV 样例（含中文表头、重复行与多站判定样例）
 tests/           端到端与并发测试（pytest + TestClient + 线程池）
-demo.sh          对运行中的服务执行 上传→查询→合并→冲突→清理 全流程
+demo.sh          对运行中的服务执行 上传→查询→合并→冲突→清理→区域判定 全流程
 Dockerfile
 docker-compose.yml
 ```
@@ -70,6 +71,7 @@ pytest -q
 | `GET`  | `/stations/{station_id}/days/{day}/records` | **实际读取已发布 Parquet 文件**，返回全部记录与所用批次清单 |
 | `POST` | `/stations/{station_id}/days/{day}/merge` | 把当前已发布的小批次原子合并为一个 Parquet 文件 |
 | `GET`  | `/stations/{station_id}/days/{day}/batches` | 列出该站日全部批次（含 `published` / `superseded` 与文件是否还在） |
+| `POST` | `/alerts/regional-rainfall` | 区域强降雨判定：同一快照内逐分钟滑动 30 分钟窗口，找最早两站齐报达标窗口 |
 | `POST` | `/admin/reap` | 立即清理无查询引用的旧文件（后台线程默认每 5 秒自动执行） |
 | `GET`  | `/health` | 健康检查 |
 
@@ -97,6 +99,51 @@ curl http://localhost:8000/stations/ST001/days/2026-11-12/records
 curl -X POST http://localhost:8000/stations/ST001/days/2026-11-12/merge
 ```
 
+## 区域强降雨判定 `POST /alerts/regional-rainfall`
+
+防汛值班员据此判断区域强降雨**最早何时出现**。请求体（JSON）：
+
+```json
+{
+  "day": "2026-11-12",
+  "station_ids": ["ST003", "ST004"],
+  "period_start": "2026-11-12T08:00Z",
+  "period_end": "2026-11-12T08:35Z",
+  "threshold_mm": 20.0
+}
+```
+
+输入约束：
+
+- 所有站点与时间必须属于**同一个 UTC 日期** `day`；
+- `station_ids` 为 **2～5 个**互不重复的站号；
+- 时段为 UTC、分钟对齐（秒为 0），长度 **≤ 120 分钟**；
+- `threshold_mm` 为非负的 **30 分钟累计雨量**阈值。
+
+判定规则（实现见 `app/alerts.py`）：
+
+1. 30 分钟固定窗口在时段内**逐分钟滑动**，窗口完全落在时段内
+   （60 分钟时段产生 31 个窗口；不足 30 分钟的时段返回 `windows_evaluated=0`）。
+2. 站点在某窗口内**可用**的充要条件是该窗口每一分钟都观测齐全且无冲突：
+   - 同一分钟重复且**雨量相同**的记录只计一次；
+   - 同一分钟出现**不同雨量**即冲突，该站在所有覆盖此分钟的窗口内不可用；
+   - 分钟**缺测**同样使该站在覆盖窗口内不可用（响应的
+     `station_statuses` 给出具体的 `missing_minutes` / `conflict_minutes`）。
+3. 只有**同一窗口**内至少两个可用站各自的 30 分钟累计都 `>= threshold_mm`
+   才告警；返回**最早**告警窗口与每个参与站该窗口的逐分钟雨量。站点峰值
+   不允许跨窗口拼接；没有窗口达标时 `triggered=false` 并附原因。
+
+```bash
+curl -X POST http://localhost:8000/alerts/regional-rainfall \
+  -H "Content-Type: application/json" \
+  -d '{"day":"2026-11-12","station_ids":["ST003","ST004"],
+       "period_start":"2026-11-12T08:00Z","period_end":"2026-11-12T08:35Z",
+       "threshold_mm":20.0}'
+```
+
+响应中 `snapshot_token` 与 `batch_ids_by_station` 标明本次判定读取的快照与
+每个站点实际使用的批次，便于复盘核对。
+
 ## 并发与一致性设计（对应需求逐条）
 
 1. **每次上传独立保留**：每次上传生成 `B-...` 批次，各自一个 Parquet 文件
@@ -118,6 +165,12 @@ curl -X POST http://localhost:8000/stations/ST001/days/2026-11-12/merge
    元数据在单个 `BEGIN IMMEDIATE` 事务里完成“插入合并批次 + supersede 源”，
    任一步失败即回滚并删除半成品；半成品没有元数据行，永远不会出现在查询快照中。
    进程崩溃后重启时 `startup_sweep` 清理临时文件、无元数据的孤儿 Parquet 与残留锁。
+9. **跨站判定读取同一已发布快照**：`/alerts/regional-rainfall` 通过
+   `open_multi_snapshot` 在一次 SQLite 读取中选取全部请求站日的已发布文件，
+   并在同一把引用锁内一次性 pin 住；判定结束前这些文件不会被 reaper 清理，
+   判定期间完成的合并/上传不改变本次判定所见集合。上传与合并可与判定并行。
+10. **读取失败不给部分结论**：快照内任一 Parquet 文件读取失败即抛出
+    `SnapshotReadError`（HTTP 500）并释放全部引用，不会只凭部分站点出结论。
 
 ### 边界说明
 

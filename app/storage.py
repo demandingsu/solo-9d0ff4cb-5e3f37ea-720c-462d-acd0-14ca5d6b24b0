@@ -161,6 +161,72 @@ class FileManager:
                 else:
                     self._refs[key] = count - 1
 
+    def open_multi_snapshot(
+        self, targets: List[tuple[str, str]]
+    ) -> tuple[dict[tuple[str, str], List[FileRef]], str]:
+        """Pin one consistent published-file set covering several station/days.
+
+        Cross-station judgments must read a single published snapshot. The
+        published file sets for *all* requested station/days are selected in
+        one SQLite read and reference-pinned under one lock acquisition, so no
+        merge can swap a set between the per-station selections. A station/day
+        without any published file simply maps to an empty ref list (the
+        station has no usable observations in the snapshot).
+
+        Returns ``({(station_id, day): refs}, snapshot_token)``.
+        """
+        if not targets:
+            return {}, f"multi@{time.time_ns()}"
+        conn = db.connect()
+        try:
+            # One statement over one WAL connection: all rows are observed from
+            # the same database snapshot; publication order is preserved.
+            clauses = " OR ".join(
+                "(station_id = ? AND day = ?)" for _ in targets
+            )
+            params = [item for pair in targets for item in pair]
+            rows = conn.execute(
+                "SELECT station_id, day, batch_id, file_path, row_count, "
+                "is_merged, created_at FROM batches "
+                f"WHERE status = 'published' AND ({clauses}) "
+                "ORDER BY created_at ASC, rowid ASC",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        grouped: dict[tuple[str, str], List[FileRef]] = {pair: [] for pair in targets}
+        for r in rows:
+            grouped[(r["station_id"], r["day"])].append(
+                FileRef(
+                    batch_id=r["batch_id"],
+                    path=Path(r["file_path"]),
+                    row_count=r["row_count"],
+                    is_merged=bool(r["is_merged"]),
+                    created_at=r["created_at"],
+                )
+            )
+
+        all_refs = [ref for refs in grouped.values() for ref in refs]
+        with self._ref_lock:
+            for ref in all_refs:
+                key = ref.path.name
+                self._refs[key] = self._refs.get(key, 0) + 1
+        token = f"multi:{'|'.join(f'{s}/{d}' for s, d in targets)}@{time.time_ns()}"
+        return grouped, token
+
+    def read_table_checked(self, refs: List[FileRef]) -> pa.Table:
+        """Read a pinned snapshot, failing loudly instead of returning partial data."""
+        try:
+            return self.read_table(refs)
+        except Exception as exc:  # pyarrow/OS errors on a pinned published file
+            from .errors import SnapshotReadError
+
+            raise SnapshotReadError(
+                f"failed to read snapshot files "
+                f"{[r.batch_id for r in refs]}: {exc}"
+            ) from exc
+
     def _active_ref_names(self) -> set[str]:
         with self._ref_lock:
             return set(self._refs.keys())

@@ -69,3 +69,41 @@ curl -fsS "${BASE_URL}/stations/${STATION}/days/${DAY}/batches" \
 import sys, json
 for b in json.load(sys.stdin)['batches']:
     print(f\"  {b['batch_id']}  status={b['status']:<10} file_exists={b['file_exists']}\")"
+
+echo; echo "### 7. regional heavy-rainfall alert (two stations, one published snapshot)"
+for f in \
+  "${SAMPLES}/st003_2026-11-12_alert.csv" \
+  "${SAMPLES}/st004_2026-11-12_alert.csv"; do
+  curl -fsS -X POST -F "file=@${f};filename=$(basename "$f")" \
+    "${BASE_URL}/stations/$(basename "$f" | cut -d_ -f1 | tr '[:lower:]' '[:upper:]')/days/${DAY}/batches" | pp
+done
+
+echo; echo "## 7a. alert with a 20 mm / 30-minute threshold over 08:00-08:35"
+curl -fsS -X POST "${BASE_URL}/alerts/regional-rainfall" \
+  -H "Content-Type: application/json" \
+  -d '{"day":"2026-11-12","station_ids":["ST003","ST004"],
+       "period_start":"2026-11-12T08:00Z","period_end":"2026-11-12T08:35Z",
+       "threshold_mm":20.0}' \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(json.dumps({'triggered': d['triggered'],
+                  'snapshot_token': d['snapshot_token'],
+                  'windows_evaluated': d['windows_evaluated'],
+                  'alert_window': None if not d['alert'] else
+                      [d['alert']['window_start'], d['alert']['window_end']],
+                  'participants': None if not d['alert'] else
+                      {p['station_id']: p['rain_total_mm']
+                       for p in d['alert']['participating_stations']}}, indent=2))"
+
+echo; echo "## 7b. same data, threshold never reached -> not triggered"
+curl -fsS -X POST "${BASE_URL}/alerts/regional-rainfall" \
+  -H "Content-Type: application/json" \
+  -d '{"day":"2026-11-12","station_ids":["ST003","ST004"],
+       "period_start":"2026-11-12T08:00Z","period_end":"2026-11-12T08:35Z",
+       "threshold_mm":999.0}' \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(json.dumps({'triggered': d['triggered'], 'reason': d['reason'],
+                  'final_window_status': d['station_statuses']}, indent=2, ensure_ascii=False))"
